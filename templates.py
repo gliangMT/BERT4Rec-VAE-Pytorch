@@ -1,3 +1,5 @@
+import torch
+
 def set_template(args):
     if args.template is None:
         return
@@ -25,7 +27,10 @@ def set_template(args):
         args.test_negative_sampling_seed = 98765
 
         args.trainer_code = 'bert'
-        args.device = 'cuda'
+        if torch.cuda.is_available():
+            args.device = 'cuda'
+        elif hasattr(torch, 'musa') and torch.musa.is_available():
+            args.device = 'musa'
         args.num_gpu = 1
         args.device_idx = '0'
         args.optimizer = 'Adam'
@@ -65,7 +70,10 @@ def set_template(args):
         args.test_batch_size = batch
 
         args.trainer_code = 'dae'
-        args.device = 'cuda'
+        if torch.cuda.is_available():
+            args.device = 'cuda'
+        elif hasattr(torch, 'musa') and torch.musa.is_available():
+            args.device = 'musa'
         args.num_gpu = 1
         args.device_idx = '0'
         args.optimizer = 'Adam'
@@ -101,7 +109,10 @@ def set_template(args):
         args.test_batch_size = batch
 
         args.trainer_code = 'vae'
-        args.device = 'cuda'
+        if torch.cuda.is_available():
+            args.device = 'cuda'
+        elif hasattr(torch, 'musa') and torch.musa.is_available():
+            args.device = 'musa'
         args.num_gpu = 1
         args.device_idx = '0'
         args.optimizer = 'Adam'
@@ -139,7 +150,10 @@ def set_template(args):
         args.test_batch_size = batch
 
         args.trainer_code = 'vae'
-        args.device = 'cuda'
+        if torch.cuda.is_available():
+            args.device = 'cuda'
+        elif hasattr(torch, 'musa') and torch.musa.is_available():
+            args.device = 'musa'
         args.num_gpu = 1
         args.device_idx = '0'
         args.optimizer = 'Adam'

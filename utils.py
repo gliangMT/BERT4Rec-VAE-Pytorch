@@ -65,14 +65,21 @@ def export_experiments_config_as_json(args, experiment_path):
 def fix_random_seed_as(random_seed):
     random.seed(random_seed)
     torch.manual_seed(random_seed)
-    torch.cuda.manual_seed_all(random_seed)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(random_seed)
+    elif hasattr(torch, 'musa') and torch.musa.is_available():
+        torch.musa.manual_seed_all(random_seed)
     np.random.seed(random_seed)
     cudnn.deterministic = True
     cudnn.benchmark = False
 
 
 def set_up_gpu(args):
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.device_idx
+    if torch.cuda.is_available():
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.device_idx
+    elif hasattr(torch, 'musa') and torch.musa.is_available():
+        os.environ['MUSA_VISIBLE_DEVICES'] = args.device_idx
     args.num_gpu = len(args.device_idx.split(","))
 
 
