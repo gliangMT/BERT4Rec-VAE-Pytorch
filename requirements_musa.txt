@@ -1,0 +1,9 @@
+# should work in torch_musa images
+# torch_musa requires only for MUSA devices
+# torch_musa >= 2.5.0
+wget==3.2
+tqdm>=4.67.1
+tensorboard>=2.1.0
+pandas>=2.3.3
+scipy==1.10.1
+future==0.18.2
