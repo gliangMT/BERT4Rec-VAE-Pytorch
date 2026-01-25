@@ -6,10 +6,28 @@ from .vae import VAETrainer
 TRAINERS = {
     BERTTrainer.code(): BERTTrainer,
     DAETrainer.code(): DAETrainer,
-    VAETrainer.code(): VAETrainer
+    VAETrainer.code(): VAETrainer,
 }
 
 
-def trainer_factory(args, model, train_loader, val_loader, test_loader, export_root):
+def trainer_factory(
+    args,
+    model,
+    train_loader,
+    val_loader,
+    test_loader,
+    export_root,
+    distributed,
+    rank,
+):
     trainer = TRAINERS[args.trainer_code]
-    return trainer(args, model, train_loader, val_loader, test_loader, export_root)
+    return trainer(
+        args,
+        model,
+        train_loader,
+        val_loader,
+        test_loader,
+        export_root,
+        distributed,
+        rank,
+    )

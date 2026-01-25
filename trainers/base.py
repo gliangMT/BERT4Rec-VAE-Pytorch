@@ -3,9 +3,11 @@ from config import STATE_DICT_KEY, OPTIMIZER_STATE_DICT_KEY
 from utils import AverageMeterSet
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 import json
@@ -14,20 +16,45 @@ from pathlib import Path
 
 
 class AbstractTrainer(metaclass=ABCMeta):
-    def __init__(self, args, model, train_loader, val_loader, test_loader, export_root):
+    def __init__(
+        self,
+        args,
+        model,
+        train_loader,
+        val_loader,
+        test_loader,
+        export_root,
+        distributed=False,
+        local_rank=0,
+    ):
         self.args = args
-        self.device = args.device
+        self.distributed = distributed
+        self.local_rank = local_rank
+        if args.device == "cuda":
+            self.device = torch.device(f"cuda:{local_rank}")
+        elif args.device == "musa":
+            self.device = torch.device(f"musa:{local_rank}")
+
         self.model = model.to(self.device)
-        self.is_parallel = args.num_gpu > 1
-        if self.is_parallel:
-            self.model = nn.DataParallel(self.model)
+        # self.is_parallel = args.num_gpu > 1
+        # if self.is_parallel:  # DP
+        # self.model = nn.DataParallel(self.model)
+        if distributed:  # DDP
+            self.model = nn.parallel.DistributedDataParallel(
+                self.model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=False,
+            )
 
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.test_loader = test_loader
         self.optimizer = self._create_optimizer()
         if args.enable_lr_schedule:
-            self.lr_scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=args.decay_step, gamma=args.gamma)
+            self.lr_scheduler = optim.lr_scheduler.StepLR(
+                self.optimizer, step_size=args.decay_step, gamma=args.gamma
+            )
 
         self.num_epochs = args.num_epochs
         self.metric_ks = args.metric_ks
@@ -64,15 +91,39 @@ class AbstractTrainer(metaclass=ABCMeta):
     def calculate_metrics(self, batch):
         pass
 
+    def _wrap_dataloader(self, dataloader):
+        if not dist.is_initialized() or self.local_rank == 0:
+            return tqdm(dataloader)
+        return dataloader
+
     def train(self):
         accum_iter = 0
-        self.validate(0, accum_iter)
+        # only rank 0 performs validation and logging
+        if not dist.is_initialized() or self.local_rank == 0:
+            print("Validate before training")
+            # self.validate(0, accum_iter)
+
+        if self.distributed:
+            dist.barrier()
+
         for epoch in range(self.num_epochs):
+            if isinstance(self.train_loader.sampler, DistributedSampler):
+                self.train_loader.sampler.set_epoch(epoch)
             accum_iter = self.train_one_epoch(epoch, accum_iter)
-            self.validate(epoch, accum_iter)
-        self.logger_service.complete({
-            'state_dict': (self._create_state_dict()),
-        })
+
+            # only rank 0 logging
+            if not dist.is_initialized() or self.local_rank == 0:
+                print(f"Validate after epoch {epoch + 1} on rank0")
+                # self.validate(epoch, accum_iter)
+
+            if self.distributed:
+                dist.barrier()
+
+        self.logger_service.complete(
+            {
+                "state_dict": (self._create_state_dict()),
+            }
+        )
         self.writer.close()
 
     def train_one_epoch(self, epoch, accum_iter):
@@ -81,30 +132,38 @@ class AbstractTrainer(metaclass=ABCMeta):
             self.lr_scheduler.step()
 
         average_meter_set = AverageMeterSet()
-        tqdm_dataloader = tqdm(self.train_loader)
+        tqdm_dataloader = self._wrap_dataloader(self.train_loader)
 
         for batch_idx, batch in enumerate(tqdm_dataloader):
             batch_size = batch[0].size(0)
             batch = [x.to(self.device) for x in batch]
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)  # speed up，but may cause nan
             loss = self.calculate_loss(batch)
             loss.backward()
 
             self.optimizer.step()
 
-            average_meter_set.update('loss', loss.item())
-            tqdm_dataloader.set_description(
-                'Epoch {}, loss {:.3f} '.format(epoch+1, average_meter_set['loss'].avg))
+            average_meter_set.update("loss", loss.item())
+            if not dist.is_initialized() or self.local_rank == 0:
+                tqdm_dataloader.set_description(
+                    "Epoch {}, loss {:.3f} ".format(
+                        epoch + 1, average_meter_set["loss"].avg
+                    )
+                )
 
-            accum_iter += batch_size
+            # accum_iter += batch_size
+            accum_iter += batch_size * (
+                1 if not self.distributed else dist.get_world_size()
+            )
 
             if self._needs_to_log(accum_iter):
-                tqdm_dataloader.set_description('Logging to Tensorboard')
+                if not dist.is_initialized() or self.local_rank == 0:
+                    tqdm_dataloader.set_description("Logging to Tensorboard")
                 log_data = {
-                    'state_dict': (self._create_state_dict()),
-                    'epoch': epoch+1,
-                    'accum_iter': accum_iter,
+                    "state_dict": (self._create_state_dict()),
+                    "epoch": epoch + 1,
+                    "accum_iter": accum_iter,
                 }
                 log_data.update(average_meter_set.averages())
                 self.log_extra_train_info(log_data)
@@ -118,7 +177,7 @@ class AbstractTrainer(metaclass=ABCMeta):
         average_meter_set = AverageMeterSet()
 
         with torch.no_grad():
-            tqdm_dataloader = tqdm(self.val_loader)
+            tqdm_dataloader = self._wrap_dataloader(self.val_loader)
             for batch_idx, batch in enumerate(tqdm_dataloader):
                 batch = [x.to(self.device) for x in batch]
 
@@ -126,33 +185,40 @@ class AbstractTrainer(metaclass=ABCMeta):
 
                 for k, v in metrics.items():
                     average_meter_set.update(k, v)
-                description_metrics = ['NDCG@%d' % k for k in self.metric_ks[:3]] +\
-                                      ['Recall@%d' % k for k in self.metric_ks[:3]]
-                description = 'Val: ' + ', '.join(s + ' {:.3f}' for s in description_metrics)
-                description = description.replace('NDCG', 'N').replace('Recall', 'R')
-                description = description.format(*(average_meter_set[k].avg for k in description_metrics))
+                description_metrics = ["NDCG@%d" % k for k in self.metric_ks[:3]] + [
+                    "Recall@%d" % k for k in self.metric_ks[:3]
+                ]
+                description = "Val: " + ", ".join(
+                    s + " {:.3f}" for s in description_metrics
+                )
+                description = description.replace("NDCG", "N").replace("Recall", "R")
+                description = description.format(
+                    *(average_meter_set[k].avg for k in description_metrics)
+                )
                 tqdm_dataloader.set_description(description)
 
             log_data = {
-                'state_dict': (self._create_state_dict()),
-                'epoch': epoch+1,
-                'accum_iter': accum_iter,
+                "state_dict": (self._create_state_dict()),
+                "epoch": epoch + 1,
+                "accum_iter": accum_iter,
             }
             log_data.update(average_meter_set.averages())
             self.log_extra_val_info(log_data)
             self.logger_service.log_val(log_data)
 
     def test(self):
-        print('Test best model with test set!')
+        print("Test best model with test set!")
 
-        best_model = torch.load(os.path.join(self.export_root, 'models', 'best_acc_model.pth')).get('model_state_dict')
+        best_model = torch.load(
+            os.path.join(self.export_root, "models", "best_acc_model.pth")
+        ).get("model_state_dict")
         self.model.load_state_dict(best_model)
         self.model.eval()
 
         average_meter_set = AverageMeterSet()
 
         with torch.no_grad():
-            tqdm_dataloader = tqdm(self.test_loader)
+            tqdm_dataloader = self._wrap_dataloader(self.test_loader)
             for batch_idx, batch in enumerate(tqdm_dataloader):
                 batch = [x.to(self.device) for x in batch]
 
@@ -160,52 +226,90 @@ class AbstractTrainer(metaclass=ABCMeta):
 
                 for k, v in metrics.items():
                     average_meter_set.update(k, v)
-                description_metrics = ['NDCG@%d' % k for k in self.metric_ks[:3]] +\
-                                      ['Recall@%d' % k for k in self.metric_ks[:3]]
-                description = 'Val: ' + ', '.join(s + ' {:.3f}' for s in description_metrics)
-                description = description.replace('NDCG', 'N').replace('Recall', 'R')
-                description = description.format(*(average_meter_set[k].avg for k in description_metrics))
+                description_metrics = ["NDCG@%d" % k for k in self.metric_ks[:3]] + [
+                    "Recall@%d" % k for k in self.metric_ks[:3]
+                ]
+                description = "Val: " + ", ".join(
+                    s + " {:.3f}" for s in description_metrics
+                )
+                description = description.replace("NDCG", "N").replace("Recall", "R")
+                description = description.format(
+                    *(average_meter_set[k].avg for k in description_metrics)
+                )
                 tqdm_dataloader.set_description(description)
 
             average_metrics = average_meter_set.averages()
-            with open(os.path.join(self.export_root, 'logs', 'test_metrics.json'), 'w') as f:
+            with open(
+                os.path.join(self.export_root, "logs", "test_metrics.json"), "w"
+            ) as f:
                 json.dump(average_metrics, f, indent=4)
             print(average_metrics)
 
     def _create_optimizer(self):
         args = self.args
-        if args.optimizer.lower() == 'adam':
-            return optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        elif args.optimizer.lower() == 'sgd':
-            return optim.SGD(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum)
+        if args.optimizer.lower() == "adam":
+            return optim.Adam(
+                self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+            )
+        elif args.optimizer.lower() == "sgd":
+            return optim.SGD(
+                self.model.parameters(),
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                momentum=args.momentum,
+            )
         else:
             raise ValueError
 
     def _create_loggers(self):
         root = Path(self.export_root)
-        writer = SummaryWriter(root.joinpath('logs'))
-        model_checkpoint = root.joinpath('models')
+        writer = SummaryWriter(root.joinpath("logs"))
+        model_checkpoint = root.joinpath("models")
 
         train_loggers = [
-            MetricGraphPrinter(writer, key='epoch', graph_name='Epoch', group_name='Train'),
-            MetricGraphPrinter(writer, key='loss', graph_name='Loss', group_name='Train'),
+            MetricGraphPrinter(
+                writer, key="epoch", graph_name="Epoch", group_name="Train"
+            ),
+            MetricGraphPrinter(
+                writer, key="loss", graph_name="Loss", group_name="Train"
+            ),
         ]
 
         val_loggers = []
         for k in self.metric_ks:
             val_loggers.append(
-                MetricGraphPrinter(writer, key='NDCG@%d' % k, graph_name='NDCG@%d' % k, group_name='Validation'))
+                MetricGraphPrinter(
+                    writer,
+                    key="NDCG@%d" % k,
+                    graph_name="NDCG@%d" % k,
+                    group_name="Validation",
+                )
+            )
             val_loggers.append(
-                MetricGraphPrinter(writer, key='Recall@%d' % k, graph_name='Recall@%d' % k, group_name='Validation'))
+                MetricGraphPrinter(
+                    writer,
+                    key="Recall@%d" % k,
+                    graph_name="Recall@%d" % k,
+                    group_name="Validation",
+                )
+            )
         val_loggers.append(RecentModelLogger(model_checkpoint))
-        val_loggers.append(BestModelLogger(model_checkpoint, metric_key=self.best_metric))
+        val_loggers.append(
+            BestModelLogger(model_checkpoint, metric_key=self.best_metric)
+        )
         return writer, train_loggers, val_loggers
+
+    def _unwrap_model(self):
+        return self.model.module if hasattr(self.model, "module") else self.model
 
     def _create_state_dict(self):
         return {
-            STATE_DICT_KEY: self.model.module.state_dict() if self.is_parallel else self.model.state_dict(),
+            STATE_DICT_KEY: self._unwrap_model().state_dict(),
             OPTIMIZER_STATE_DICT_KEY: self.optimizer.state_dict(),
         }
 
     def _needs_to_log(self, accum_iter):
-        return accum_iter % self.log_period_as_iter < self.args.train_batch_size and accum_iter != 0
+        return (
+            accum_iter % self.log_period_as_iter < self.args.train_batch_size
+            and accum_iter != 0
+        )

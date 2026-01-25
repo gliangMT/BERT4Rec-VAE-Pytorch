@@ -9,12 +9,34 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 from torch import optim as optim
 
 
+# Initialize distributed training
+def init_distributed():
+    if not dist.is_available():
+        raise RuntimeError("Distributed package is not available")
+
+    if torch.cuda.is_available():
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+    elif hasattr(torch, "musa") and torch.musa.is_available():
+        dist.init_process_group(backend="mccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.musa.set_device(local_rank)
+
+    return local_rank
+
+
+def cleanup_distributed():
+    dist.destroy_process_group()
+
+
 def setup_train(args):
-    set_up_gpu(args)
+    # set_up_gpu(args)
 
     export_root = create_experiment_export_folder(args)
     export_experiments_config_as_json(args, export_root)
@@ -24,17 +46,24 @@ def setup_train(args):
 
 
 def create_experiment_export_folder(args):
-    experiment_dir, experiment_description = args.experiment_dir, args.experiment_description
+    experiment_dir, experiment_description = (
+        args.experiment_dir,
+        args.experiment_description,
+    )
     if not os.path.exists(experiment_dir):
         os.mkdir(experiment_dir)
-    experiment_path = get_name_of_experiment_path(experiment_dir, experiment_description)
+    experiment_path = get_name_of_experiment_path(
+        experiment_dir, experiment_description
+    )
     os.mkdir(experiment_path)
-    print('Folder created: ' + os.path.abspath(experiment_path))
+    print("Folder created: " + os.path.abspath(experiment_path))
     return experiment_path
 
 
 def get_name_of_experiment_path(experiment_dir, experiment_description):
-    experiment_path = os.path.join(experiment_dir, (experiment_description + "_" + str(date.today())))
+    experiment_path = os.path.join(
+        experiment_dir, (experiment_description + "_" + str(date.today()))
+    )
     idx = _get_experiment_index(experiment_path)
     experiment_path = experiment_path + "_" + str(idx)
     return experiment_path
@@ -52,54 +81,69 @@ def load_weights(model, path):
 
 
 def save_test_result(export_root, result):
-    filepath = Path(export_root).joinpath('test_result.txt')
-    with filepath.open('w') as f:
+    filepath = Path(export_root).joinpath("test_result.txt")
+    with filepath.open("w") as f:
         json.dump(result, f, indent=2)
 
 
 def export_experiments_config_as_json(args, experiment_path):
-    with open(os.path.join(experiment_path, 'config.json'), 'w') as outfile:
+    with open(os.path.join(experiment_path, "config.json"), "w") as outfile:
         json.dump(vars(args), outfile, indent=2)
 
 
 def fix_random_seed_as(random_seed):
     random.seed(random_seed)
     torch.manual_seed(random_seed)
-    
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(random_seed)
-    elif hasattr(torch, 'musa') and torch.musa.is_available():
+    elif hasattr(torch, "musa") and torch.musa.is_available():
         torch.musa.manual_seed_all(random_seed)
     np.random.seed(random_seed)
     cudnn.deterministic = True
     cudnn.benchmark = False
 
 
-def set_up_gpu(args):
-    if torch.cuda.is_available():
-        os.environ['CUDA_VISIBLE_DEVICES'] = args.device_idx
-    elif hasattr(torch, 'musa') and torch.musa.is_available():
-        os.environ['MUSA_VISIBLE_DEVICES'] = args.device_idx
-    args.num_gpu = len(args.device_idx.split(","))
+# def set_up_gpu(args):
+#     if torch.cuda.is_available():
+#         os.environ['CUDA_VISIBLE_DEVICES'] = args.device_idx
+#     elif hasattr(torch, 'musa') and torch.musa.is_available():
+#         os.environ['MUSA_VISIBLE_DEVICES'] = args.device_idx
+#     args.num_gpu = len(args.device_idx.split(","))
 
 
 def load_pretrained_weights(model, path):
     chk_dict = torch.load(os.path.abspath(path))
-    model_state_dict = chk_dict[STATE_DICT_KEY] if STATE_DICT_KEY in chk_dict else chk_dict['state_dict']
+    model_state_dict = (
+        chk_dict[STATE_DICT_KEY]
+        if STATE_DICT_KEY in chk_dict
+        else chk_dict["state_dict"]
+    )
     model.load_state_dict(model_state_dict)
 
 
 def setup_to_resume(args, model, optimizer):
-    chk_dict = torch.load(os.path.join(os.path.abspath(args.resume_training), 'models/checkpoint-recent.pth'))
+    chk_dict = torch.load(
+        os.path.join(
+            os.path.abspath(args.resume_training), "models/checkpoint-recent.pth"
+        )
+    )
     model.load_state_dict(chk_dict[STATE_DICT_KEY])
     optimizer.load_state_dict(chk_dict[OPTIMIZER_STATE_DICT_KEY])
 
 
 def create_optimizer(model, args):
-    if args.optimizer == 'Adam':
-        return optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "Adam":
+        return optim.Adam(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
 
-    return optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=args.momentum)
+    return optim.SGD(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        momentum=args.momentum,
+    )
 
 
 class AverageMeterSet(object):
@@ -122,17 +166,26 @@ class AverageMeterSet(object):
         for meter in self.meters.values():
             meter.reset()
 
-    def values(self, format_string='{}'):
-        return {format_string.format(name): meter.val for name, meter in self.meters.items()}
+    def values(self, format_string="{}"):
+        return {
+            format_string.format(name): meter.val for name, meter in self.meters.items()
+        }
 
-    def averages(self, format_string='{}'):
-        return {format_string.format(name): meter.avg for name, meter in self.meters.items()}
+    def averages(self, format_string="{}"):
+        return {
+            format_string.format(name): meter.avg for name, meter in self.meters.items()
+        }
 
-    def sums(self, format_string='{}'):
-        return {format_string.format(name): meter.sum for name, meter in self.meters.items()}
+    def sums(self, format_string="{}"):
+        return {
+            format_string.format(name): meter.sum for name, meter in self.meters.items()
+        }
 
-    def counts(self, format_string='{}'):
-        return {format_string.format(name): meter.count for name, meter in self.meters.items()}
+    def counts(self, format_string="{}"):
+        return {
+            format_string.format(name): meter.count
+            for name, meter in self.meters.items()
+        }
 
 
 class AverageMeter(object):
@@ -157,4 +210,6 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
     def __format__(self, format):
-        return "{self.val:{format}} ({self.avg:{format}})".format(self=self, format=format)
+        return "{self.val:{format}} ({self.avg:{format}})".format(
+            self=self, format=format
+        )
